@@ -14,14 +14,6 @@
             <div id="status" class="status">Microphone: Not active</div>
             <div class="audio-controls">
                 <div class="device-select">
-                    <label for="languageSelect">Language:</label>
-                    <select id="languageSelect"></select>
-                </div>
-                <div class="device-select">
-                    <label for="voiceModel">Voice Model:</label>
-                    <select id="voiceModel"></select>
-                </div>
-                <div class="device-select">
                     <label for="inputDevice">Input Device:</label>
                     <select id="inputDevice"></select>
                 </div>
@@ -52,8 +44,6 @@
     <script>
         const socket = io();
         const startButton = document.getElementById('startButton');
-        const languageSelect = document.getElementById('languageSelect');
-        const voiceModelSelect = document.getElementById('voiceModel');
         const conversationMessages = document.getElementById('conversationMessages');
         const logMessages = document.getElementById('logMessages');
         const statusDiv = document.getElementById('status');
@@ -67,10 +57,9 @@
         let messageCounter = 0;
         const messageHeights = new Map();
         const messageOrder = [];
-        let currentLanguage = 'en';
+        // Default voice settings (can be changed via voice commands)
         let currentVoiceModel = 'aura-2-thalia-en';
-        let currentVoiceName = '';
-        let allTTSModels = [];
+        let currentVoiceName = 'Thalia';
         let lastLogElement = null;
 
         // Populate audio devices
@@ -109,95 +98,6 @@
 
         navigator.mediaDevices.addEventListener('devicechange', loadAudioDevices);
         loadAudioDevices();
-        loadTTSModels();
-        
-        function populateVoiceModelsForLanguage(lang) {
-            voiceModelSelect.innerHTML = '';
-            const modelsForLang = (allTTSModels || []).filter(m => (m.language || 'en') === lang);
-            modelsForLang.forEach(model => {
-                if (!model.name) return;
-                const option = document.createElement('option');
-                option.value = model.name;
-                let displayName = model.display_name || model.name;
-                displayName = displayName.charAt(0).toUpperCase() + displayName.slice(1);
-                let description = model.accent ? model.accent + ' accent' : '';
-                let optionText = displayName;
-                if (model.language) optionText += ' (' + model.language + ')';
-                if (description) optionText += ' - ' + description;
-                option.text = optionText;
-                option.dataset.voiceName = displayName;
-                option.dataset.language = model.language || 'en';
-                if (model.tags) option.title = model.tags;
-                voiceModelSelect.appendChild(option);
-            });
-            if (voiceModelSelect.options.length > 0) {
-                let found = false;
-                if (currentVoiceModel) {
-                    for (let i = 0; i < voiceModelSelect.options.length; i++) {
-                        if (voiceModelSelect.options[i].value === currentVoiceModel) {
-                            voiceModelSelect.selectedIndex = i;
-                            currentVoiceName = voiceModelSelect.options[i].dataset.voiceName;
-                            currentLanguage = voiceModelSelect.options[i].dataset.language || 'en';
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found) {
-                    voiceModelSelect.selectedIndex = 0;
-                    currentVoiceModel = voiceModelSelect.options[0].value;
-                    currentVoiceName = voiceModelSelect.options[0].dataset.voiceName;
-                    currentLanguage = voiceModelSelect.options[0].dataset.language || 'en';
-                }
-            }
-        }
-        
-        function loadTTSModels() {
-            fetch('/tts-models')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.error) {
-                        console.error('Error loading TTS models:', data.error);
-                        return;
-                    }
-                    allTTSModels = (data.models || []).filter(m => m.name);
-                    const langSet = new Set();
-                    allTTSModels.forEach(m => { langSet.add(m.language || 'en'); });
-                    const languages = Array.from(langSet).sort();
-                    languageSelect.innerHTML = '';
-                    languages.forEach(lang => {
-                        const opt = document.createElement('option');
-                        opt.value = lang;
-                        opt.textContent = lang;
-                        languageSelect.appendChild(opt);
-                    });
-                    if (languages.length > 0 && !languages.includes(currentLanguage)) {
-                        currentLanguage = languages[0];
-                    }
-                    if (languages.length > 0) {
-                        const idx = languages.indexOf(currentLanguage);
-                        languageSelect.selectedIndex = idx >= 0 ? idx : 0;
-                        currentLanguage = languageSelect.value;
-                    }
-                    populateVoiceModelsForLanguage(currentLanguage);
-                })
-                .catch(error => {
-                    console.error('Error fetching TTS models:', error);
-                });
-        }
-        
-        languageSelect.addEventListener('change', function() {
-            currentLanguage = this.value;
-            populateVoiceModelsForLanguage(currentLanguage);
-        });
-        
-        voiceModelSelect.addEventListener('change', function() {
-            currentVoiceModel = this.value;
-            const selectedOption = this.options[this.selectedIndex];
-            currentVoiceName = selectedOption.dataset.voiceName;
-            currentLanguage = selectedOption.dataset.language || 'en';
-            languageSelect.value = currentLanguage;
-        });
 
         startButton.addEventListener('click', async () => {
             if (!isActive) {
@@ -224,7 +124,6 @@
                         inputDeviceId: inputSelect.value,
                         voiceModel: currentVoiceModel,
                         voiceName: currentVoiceName,
-                        language: currentLanguage,
                         browserAudio: true
                     });
                     
@@ -551,6 +450,15 @@
             isActive = false;
             startButton.textContent = 'Start Voice Agent';
             statusDiv.textContent = 'Microphone: Not active';
+            stopAudioCapture();
+        });
+        
+        socket.on('voice_agent_ended', () => {
+            console.log('Voice agent call ended');
+            isActive = false;
+            startButton.textContent = 'Start Voice Agent';
+            statusDiv.textContent = 'Call ended';
+            stopAudioCapture();
         });
 
         socket.on('error', (error) => {

@@ -31,7 +31,7 @@ AUDIO_SETTINGS = {
 LISTEN_SETTINGS = {
     "provider": {
         "type": "deepgram",
-        "model": "nova-3",
+        "model": "flux-general-en",
     }
 }
 

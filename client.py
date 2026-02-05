@@ -185,11 +185,12 @@ class VoiceAgent:
                     # Send the audio data to Deepgram
                     await self.ws.send(data)
 
+        except websockets.exceptions.ConnectionClosedError:
+            # Connection closed gracefully (e.g., end_call), not an error
+            logger.info("Sender stopped: connection closed")
         except Exception as e:
             logger.error(f"Error in sender: {e}")
-            # Print stack trace for debugging
             import traceback
-
             logger.error(traceback.format_exc())
 
     async def receiver(self):
@@ -253,13 +254,13 @@ class VoiceAgent:
                                         f"Function {function_name} not found"
                                     )
 
-                                # Special handling for end_call which needs websocket
+                                # Special handling for end_call (needs websocket + closes connection)
                                 if function_name == "end_call":
                                     result = await func(self.ws, parameters)
                                     
                                     # Extract messages
-                                    inject_message = result["inject_message"]
                                     function_response = result["function_response"]
+                                    inject_message = result["inject_message"]
 
                                     # First send the function response
                                     response = {
@@ -285,7 +286,13 @@ class VoiceAgent:
                                     logger.info(f"Sending ws close message")
                                     await close_websocket_with_timeout(self.ws)
                                     self.is_running = False
+                                    # Notify frontend that call ended
+                                    socketio.emit("voice_agent_ended")
                                     break
+                                # switch_voice needs websocket
+                                elif function_name == "switch_voice":
+                                    result = await func(self.ws, parameters)
+                                    logger.info(f"Voice switched to: {result.get('new_voice_name')}")
                                 else:
                                     result = await func(parameters)
 

@@ -47,7 +47,8 @@ async def test_kapa_query():
         
         if result.get("success"):
             print(f"Latency: {result.get('latency_seconds', 'N/A')}s")
-            print(f"Answer: {result.get('answer', 'No answer')[:500]}...")
+            print(f"Chunks retrieved: {result.get('num_chunks', 0)}")
+            print(f"Context:\n{result.get('context', 'No context')[:800]}...")
         else:
             print(f"Error: {result.get('error', 'Unknown error')}")
         
