@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <title>Deepgram Voice Agent</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+        <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    </head>
+<body>
+    <div class="main-container">
+        <div class="sidebar">
+            <h2>Deepgram Voice Agent</h2>
+            <button id="startButton" class="mic-button">Start Voice Agent</button>
+            <div id="status" class="status">Microphone: Not active</div>
+            <div class="audio-controls">
+                <div class="device-select">
+                    <label for="languageSelect">Language:</label>
+                    <select id="languageSelect"></select>
+                </div>
+                <div class="device-select">
+                    <label for="voiceModel">Voice Model:</label>
+                    <select id="voiceModel"></select>
+                </div>
+                <div class="device-select">
+                    <label for="inputDevice">Input Device:</label>
+                    <select id="inputDevice"></select>
+                </div>
+            </div>
+            <div class="controls">
+                <label class="toggle">
+                    <input type="checkbox" id="showLogs">
+                    <span class="toggle-label">Show Logs</span>
+                </label>
+                <label class="toggle">
+                    <input type="checkbox" id="darkMode" checked>
+                    <span class="toggle-label">Dark Mode</span>
+                </label>
+            </div>
+        </div>
+        <div class="columns-container">
+            <div id="conversation" class="timeline column">
+                <h2>Conversation</h2>
+                <div id="conversationMessages"></div>
+            </div>
+            <div id="logs" class="timeline column">
+                <h2>Logs</h2>
+                <div id="logMessages"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        const startButton = document.getElementById('startButton');
+        const languageSelect = document.getElementById('languageSelect');
+        const voiceModelSelect = document.getElementById('voiceModel');
+        const conversationMessages = document.getElementById('conversationMessages');
+        const logMessages = document.getElementById('logMessages');
+        const statusDiv = document.getElementById('status');
+        const showLogsToggle = document.getElementById('showLogs');
+        const logsColumn = document.getElementById('logs');
+        const inputSelect = document.getElementById('inputDevice');
+        
+        let isActive = false;
+        let currentGroup = null;
+        let lastMessageTimestamp = null;
+        let messageCounter = 0;
+        const messageHeights = new Map();
+        const messageOrder = [];
+        let currentLanguage = 'en';
+        let currentVoiceModel = 'aura-2-thalia-en';
+        let currentVoiceName = '';
+        let allTTSModels = [];
+        let lastLogElement = null;
+
+        // Populate audio devices
+        async function loadAudioDevices() {
+            try {
+                inputSelect.innerHTML = '';
+                
+                const defaultOption = document.createElement('option');
+                defaultOption.value = "default";
+                defaultOption.text = "Default Device";
+                defaultOption.selected = true;
+                inputSelect.appendChild(defaultOption);
+                
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const audioInputDevices = devices.filter(device => device.kind === 'audioinput');
+                
+                audioInputDevices.forEach((device, index) => {
+                    if (device.label) {
+                        const option = document.createElement('option');
+                        option.value = device.deviceId;
+                        option.text = device.label || `Microphone ${index + 1}`;
+                        inputSelect.appendChild(option);
+                    }
+                });
+                
+                if (audioInputDevices.filter(d => d.label).length === 0) {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    stream.getTracks().forEach(track => track.stop());
+                    return loadAudioDevices();
+                }
+            } catch (err) {
+                console.error('Error loading audio devices:', err);
+                statusDiv.textContent = 'Error: Could not access audio devices';
+            }
+        }
+
+        navigator.mediaDevices.addEventListener('devicechange', loadAudioDevices);
+        loadAudioDevices();
+        loadTTSModels();
+        
+        function populateVoiceModelsForLanguage(lang) {
+            voiceModelSelect.innerHTML = '';
+            const modelsForLang = (allTTSModels || []).filter(m => (m.language || 'en') === lang);
+            modelsForLang.forEach(model => {
+                if (!model.name) return;
+                const option = document.createElement('option');
+                option.value = model.name;
+                let displayName = model.display_name || model.name;
+                displayName = displayName.charAt(0).toUpperCase() + displayName.slice(1);
+                let description = model.accent ? model.accent + ' accent' : '';
+                let optionText = displayName;
+                if (model.language) optionText += ' (' + model.language + ')';
+                if (description) optionText += ' - ' + description;
+                option.text = optionText;
+                option.dataset.voiceName = displayName;
+                option.dataset.language = model.language || 'en';
+                if (model.tags) option.title = model.tags;
+                voiceModelSelect.appendChild(option);
+            });
+            if (voiceModelSelect.options.length > 0) {
+                let found = false;
+                if (currentVoiceModel) {
+                    for (let i = 0; i < voiceModelSelect.options.length; i++) {
+                        if (voiceModelSelect.options[i].value === currentVoiceModel) {
+                            voiceModelSelect.selectedIndex = i;
+                            currentVoiceName = voiceModelSelect.options[i].dataset.voiceName;
+                            currentLanguage = voiceModelSelect.options[i].dataset.language || 'en';
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    voiceModelSelect.selectedIndex = 0;
+                    currentVoiceModel = voiceModelSelect.options[0].value;
+                    currentVoiceName = voiceModelSelect.options[0].dataset.voiceName;
+                    currentLanguage = voiceModelSelect.options[0].dataset.language || 'en';
+                }
+            }
+        }
+        
+        function loadTTSModels() {
+            fetch('/tts-models')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        console.error('Error loading TTS models:', data.error);
+                        return;
+                    }
+                    allTTSModels = (data.models || []).filter(m => m.name);
+                    const langSet = new Set();
+                    allTTSModels.forEach(m => { langSet.add(m.language || 'en'); });
+                    const languages = Array.from(langSet).sort();
+                    languageSelect.innerHTML = '';
+                    languages.forEach(lang => {
+                        const opt = document.createElement('option');
+                        opt.value = lang;
+                        opt.textContent = lang;
+                        languageSelect.appendChild(opt);
+                    });
+                    if (languages.length > 0 && !languages.includes(currentLanguage)) {
+                        currentLanguage = languages[0];
+                    }
+                    if (languages.length > 0) {
+                        const idx = languages.indexOf(currentLanguage);
+                        languageSelect.selectedIndex = idx >= 0 ? idx : 0;
+                        currentLanguage = languageSelect.value;
+                    }
+                    populateVoiceModelsForLanguage(currentLanguage);
+                })
+                .catch(error => {
+                    console.error('Error fetching TTS models:', error);
+                });
+        }
+        
+        languageSelect.addEventListener('change', function() {
+            currentLanguage = this.value;
+            populateVoiceModelsForLanguage(currentLanguage);
+        });
+        
+        voiceModelSelect.addEventListener('change', function() {
+            currentVoiceModel = this.value;
+            const selectedOption = this.options[this.selectedIndex];
+            currentVoiceName = selectedOption.dataset.voiceName;
+            currentLanguage = selectedOption.dataset.language || 'en';
+            languageSelect.value = currentLanguage;
+        });
+
+        startButton.addEventListener('click', async () => {
+            if (!isActive) {
+                try {
+                    statusDiv.textContent = 'Initializing audio capture...';
+                    
+                    const hasPermission = await requestMicrophonePermission();
+                    if (!hasPermission) {
+                        statusDiv.textContent = 'Microphone permission denied';
+                        alert('Microphone permission is required for the voice agent to work.');
+                        return;
+                    }
+                    
+                    const captureStarted = await startAudioCapture();
+                    if (!captureStarted) {
+                        statusDiv.textContent = 'Failed to start audio capture';
+                        alert('Failed to start audio capture. Please check your microphone settings.');
+                        return;
+                    }
+                    
+                    statusDiv.textContent = 'Starting voice agent...';
+                    
+                    socket.emit('start_voice_agent', {
+                        inputDeviceId: inputSelect.value,
+                        voiceModel: currentVoiceModel,
+                        voiceName: currentVoiceName,
+                        language: currentLanguage,
+                        browserAudio: true
+                    });
+                    
+                    startButton.textContent = 'Stop Voice Agent';
+                    statusDiv.textContent = 'Microphone: Active';
+                    isActive = true;
+                } catch (err) {
+                    console.error('Error in voice agent initialization:', err);
+                    statusDiv.textContent = 'Error: ' + err.message;
+                    stopAudioCapture();
+                }
+            } else {
+                socket.emit('stop_voice_agent');
+                stopAudioCapture();
+                startButton.textContent = 'Start Voice Agent';
+                statusDiv.textContent = 'Microphone: Not active';
+                isActive = false;
+            }
+        });
+
+        let audioContext;
+        let mediaStream;
+        let processor;
+        let microphone;
+        
+        function floatToInt16(float32) {
+            const out = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32[i]));
+                out[i] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+            }
+            return out;
+        }
+
+        function resampleFloatToInt16_16k(input, inSampleRate) {
+            const target = 16000;
+            if (!inSampleRate || inSampleRate === target) return floatToInt16(input);
+            const ratio = inSampleRate / target;
+            const newLen = Math.max(1, Math.round(input.length / ratio));
+            const out = new Int16Array(newLen);
+            for (let i = 0; i < newLen; i++) {
+                const idx = i * ratio;
+                const i0 = Math.floor(idx);
+                const i1 = Math.min(i0 + 1, input.length - 1);
+                const frac = idx - i0;
+                const sample = input[i0] + (input[i1] - input[i0]) * frac;
+                const s = Math.max(-1, Math.min(1, sample));
+                out[i] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+            }
+            return out;
+        }
+        
+        async function requestMicrophonePermission() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                statusDiv.textContent = 'Microphone: Permission granted';
+                stream.getTracks().forEach(track => track.stop());
+                return true;
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                statusDiv.textContent = 'Microphone: Permission denied';
+                return false;
+            }
+        }
+        
+        async function startAudioCapture() {
+            try {
+                const deviceId = inputSelect.value;
+                
+                let stream;
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                } catch (permissionErr) {
+                    console.error('Error getting microphone permission:', permissionErr);
+                    return false;
+                }
+                
+                try {
+                    const audioConstraints = {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        channelCount: 1,
+                        sampleRate: { ideal: 16000 }
+                    };
+                    
+                    if (deviceId && deviceId !== 'default') {
+                        audioConstraints.deviceId = { exact: deviceId };
+                    }
+                    
+                    mediaStream = await navigator.mediaDevices.getUserMedia({
+                        audio: audioConstraints
+                    });
+                    
+                    try { stream.getTracks().forEach(track => track.stop()); } catch(_) {}
+                } catch (constraintErr) {
+                    mediaStream = stream;
+                }
+                
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+                    if (audioContext.state === 'suspended') {
+                        try { await audioContext.resume(); } catch (_) {}
+                    }
+                    
+                    microphone = audioContext.createMediaStreamSource(mediaStream);
+                    
+                    const bufferSize = 1024;
+                    processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+                    
+                    microphone.connect(processor);
+                    const zeroGainNode = audioContext.createGain();
+                    zeroGainNode.gain.value = 0.0;
+                    processor.connect(zeroGainNode);
+                    zeroGainNode.connect(audioContext.destination);
+                    
+                    processor.onaudioprocess = function(e) {
+                        if (!isActive) return;
+                        
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const inRate = audioContext.sampleRate;
+                        
+                        let pcm16;
+                        if (inRate !== 16000) {
+                            pcm16 = resampleFloatToInt16_16k(inputData, inRate);
+                        } else {
+                            pcm16 = floatToInt16(inputData);
+                        }
+                        
+                        socket.emit('audio_data', {
+                            audio: pcm16.buffer,
+                            sampleRate: 16000
+                        });
+                    };
+                    
+                    return true;
+                } catch (audioErr) {
+                    console.error('Error setting up audio processing:', audioErr);
+                    if (mediaStream) {
+                        mediaStream.getTracks().forEach(track => track.stop());
+                    }
+                    return false;
+                }
+            } catch (err) {
+                console.error('Unexpected error in startAudioCapture:', err);
+                return false;
+            }
+        }
+        
+        function stopAudioCapture() {
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (microphone) {
+                microphone.disconnect();
+                microphone = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+            if (audioContext && audioContext.state !== 'closed') {
+                audioContext.close();
+                audioContext = null;
+            }
+            stopAudioOutput();
+        }
+
+        function createSpacer(height) {
+            const spacer = document.createElement('div');
+            spacer.className = 'timeline-spacer';
+            spacer.style.height = `${height}px`;
+            return spacer;
+        }
+
+        function scrollToBottom() {
+            requestAnimationFrame(() => {
+                conversationMessages.scrollTop = conversationMessages.scrollHeight;
+                if (lastLogElement && logMessages.contains(lastLogElement)) {
+                    const lastTop = lastLogElement.offsetTop;
+                    const desired = lastTop - (logMessages.clientHeight - lastLogElement.offsetHeight);
+                    const maxScroll = Math.max(0, logMessages.scrollHeight - logMessages.clientHeight);
+                    logMessages.scrollTop = Math.min(Math.max(desired, 0), maxScroll);
+                } else {
+                    logMessages.scrollTop = logMessages.scrollHeight;
+                }
+            });
+        }
+
+        function addConversationMessage(data) {
+            const timestamp = new Date().toISOString();
+            const currentCounter = messageCounter++;
+            messageOrder.push({ id: currentCounter, timestamp: timestamp, type: 'conversation' });
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `timeline-item message ${data.role}`;
+            messageDiv.textContent = `${data.role}: ${data.content}`;
+            messageDiv.dataset.messageId = currentCounter;
+            
+            insertTimelineItem(messageDiv, timestamp, conversationMessages);
+
+            requestAnimationFrame(() => {
+                const actualHeight = messageDiv.offsetHeight;
+                messageHeights.set(currentCounter, actualHeight);
+
+                const logSpacer = createSpacer(actualHeight);
+                logSpacer.dataset.messageId = currentCounter;
+                insertTimelineItem(logSpacer, timestamp, logMessages);
+
+                if (!showLogsToggle.checked) {
+                    logSpacer.style.display = 'none';
+                    logSpacer.style.height = '0';
+                }
+
+                scrollToBottom();
+            });
+        }
+
+        socket.on('conversation_update', (data) => {
+            const timestamp = data.timestamp || new Date().toISOString();
+            const currentCounter = messageCounter++;
+            messageOrder.push({ id: currentCounter, timestamp: timestamp, type: 'conversation' });
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `timeline-item message ${data.role}`;
+            messageDiv.textContent = `${data.role}: ${data.content}`;
+            messageDiv.dataset.messageId = currentCounter;
+            
+            insertTimelineItem(messageDiv, timestamp, conversationMessages);
+            
+            requestAnimationFrame(() => {
+                const actualHeight = messageDiv.offsetHeight;
+                messageHeights.set(currentCounter, actualHeight);
+                
+                const logSpacer = createSpacer(actualHeight);
+                logSpacer.dataset.messageId = currentCounter;
+                insertTimelineItem(logSpacer, timestamp, logMessages);
+                
+                if (!showLogsToggle.checked) {
+                    logSpacer.style.display = 'none';
+                    logSpacer.style.height = '0';
+                }
+                
+                scrollToBottom();
+            });
+        });
+
+        socket.on('log_message', (data) => {
+            const currentCounter = messageCounter++;
+            messageOrder.push({ id: currentCounter, timestamp: data.timestamp, type: 'log' });
+            
+            const logDiv = document.createElement('div');
+            logDiv.className = 'timeline-item log-message';
+            logDiv.setAttribute('data-original-text', data.message);
+            logDiv.innerHTML = convertAnsiToHtml(data.message);
+            logDiv.dataset.messageId = currentCounter;
+            
+            insertTimelineItem(logDiv, data.timestamp, logMessages);
+            
+            requestAnimationFrame(() => {
+                const actualHeight = logDiv.offsetHeight;
+                messageHeights.set(currentCounter, actualHeight);
+                
+                const conversationSpacer = createSpacer(actualHeight);
+                conversationSpacer.dataset.messageId = currentCounter;
+                insertTimelineItem(conversationSpacer, data.timestamp, conversationMessages);
+                
+                if (!showLogsToggle.checked) {
+                    conversationSpacer.style.display = 'none';
+                    conversationSpacer.style.height = '0';
+                }
+                
+                scrollToBottom();
+            });
+        });
+
+        function insertTimelineItem(element, timestamp, container) {
+            element.dataset.timestamp = timestamp;
+            container.appendChild(element);
+        }
+
+        function convertAnsiToHtml(text) {
+            const ansiToHtml = {
+                dark: {
+                    '[38;5;231m': 'color: #fff;',
+                    '[38;5;116m': 'color: #87d7d7;',
+                    '[38;5;114m': 'color: #87d787;',
+                    '[38;5;183m': 'color: #d7afff;',
+                    '[38;5;186m': 'color: #d7d787;',
+                },
+                light: {
+                    '[38;5;231m': 'color: #000;',
+                    '[38;5;116m': 'color: #0086b3;',
+                    '[38;5;114m': 'color: #008744;',
+                    '[38;5;183m': 'color: #8b3d90;',
+                    '[38;5;186m': 'color: #b36d00;',
+                },
+                '[0m': ''
+            };
+
+            let html = text.replace(/\[0m/g, '');
+            const isDarkMode = document.body.classList.contains('dark-mode');
+            const colorSet = isDarkMode ? ansiToHtml.dark : ansiToHtml.light;
+
+            for (const [ansi, style] of Object.entries(colorSet)) {
+                const parts = html.split(ansi);
+                if (parts.length > 1) {
+                    html = parts.map((part, i) => {
+                        if (i === 0) return part;
+                        return `<span style="${style}">${part}</span>`;
+                    }).join('');
+                }
+            }
+
+            return html;
+        }
+
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+
+        socket.on('disconnect', () => {
+            console.log('Disconnected from server');
+            isActive = false;
+            startButton.textContent = 'Start Voice Agent';
+            statusDiv.textContent = 'Microphone: Not active';
+        });
+
+        socket.on('error', (error) => {
+            console.error('Socket error:', error);
+        });
+        
+        // Audio output
+        let audioOutputContext = null;
+        let nextPlayTime = 0;
+        let audioOutputSampleRate = 16000;
+        let lastSeq = -1;
+        
+        function playAudioOutput(audioData, sampleRate) {
+            try {
+                if (!audioOutputContext) {
+                    audioOutputContext = new (window.AudioContext || window.webkitAudioContext)();
+                    nextPlayTime = audioOutputContext.currentTime;
+                }
+                
+                if (sampleRate) {
+                    audioOutputSampleRate = sampleRate;
+                }
+                
+                const pcmData = new Int16Array(audioData);
+                const floatData = new Float32Array(pcmData.length);
+                
+                for (let i = 0; i < pcmData.length; i++) {
+                    floatData[i] = pcmData[i] / 32768.0;
+                }
+                
+                const audioBuffer = audioOutputContext.createBuffer(1, floatData.length, audioOutputSampleRate);
+                audioBuffer.getChannelData(0).set(floatData);
+                
+                scheduleAudioBuffer(audioBuffer);
+            } catch (err) {
+                console.error('Error processing audio output:', err);
+            }
+        }
+        
+        function scheduleAudioBuffer(audioBuffer) {
+            try {
+                const source = audioOutputContext.createBufferSource();
+                source.buffer = audioBuffer;
+                
+                const gainNode = audioOutputContext.createGain();
+                gainNode.gain.value = 1.0;
+                
+                source.connect(gainNode);
+                gainNode.connect(audioOutputContext.destination);
+                
+                const currentTime = audioOutputContext.currentTime;
+                const bufferDuration = audioBuffer.duration;
+                
+                if (nextPlayTime <= currentTime + 0.03) {
+                    nextPlayTime = currentTime + 0.03;
+                }
+                
+                source.start(nextPlayTime);
+                nextPlayTime += bufferDuration;
+            } catch (err) {
+                console.error('Error scheduling audio buffer:', err);
+                nextPlayTime = audioOutputContext.currentTime;
+            }
+        }
+        
+        function stopAudioOutput() {
+            nextPlayTime = 0;
+            lastSeq = -1;
+            
+            if (audioOutputContext && audioOutputContext.state !== 'closed') {
+                audioOutputContext.close();
+                audioOutputContext = null;
+            }
+            
+            audioOutputSampleRate = 16000;
+        }
+
+        socket.on('audio_output', (data) => {
+            if (isActive) {
+                if (typeof data.seq === 'number') {
+                    lastSeq = data.seq;
+                }
+                playAudioOutput(data.audio, data.sampleRate);
+            }
+        });
+
+        socket.on('stop_audio_output', () => {
+            stopAudioOutput();
+        });
+
+        showLogsToggle.addEventListener('change', () => {
+            logsColumn.style.display = showLogsToggle.checked ? 'flex' : 'none';
+
+            if (showLogsToggle.checked) {
+                requestAnimationFrame(() => {
+                    conversationMessages.querySelectorAll('.timeline-item.message').forEach(el => {
+                        const id = parseInt(el.dataset.messageId);
+                        if (!isNaN(id)) {
+                            messageHeights.set(id, el.offsetHeight);
+                        }
+                    });
+
+                    logMessages.querySelectorAll('.timeline-item.log-message').forEach(el => {
+                        const id = parseInt(el.dataset.messageId);
+                        if (!isNaN(id)) {
+                            messageHeights.set(id, el.offsetHeight);
+                        }
+                    });
+
+                    const allSpacers = document.querySelectorAll('.timeline-spacer');
+                    allSpacers.forEach(spacer => {
+                        spacer.style.display = 'block';
+                        const messageId = parseInt(spacer.dataset.messageId);
+                        const height = messageHeights.get(messageId) || 0;
+                        spacer.style.height = `${height}px`;
+                    });
+
+                    scrollToBottom();
+                });
+            } else {
+                const allSpacers = document.querySelectorAll('.timeline-spacer');
+                allSpacers.forEach(spacer => {
+                    spacer.style.display = 'none';
+                    spacer.style.height = '0';
+                });
+            }
+        });
+
+        logsColumn.style.display = showLogsToggle.checked ? 'flex' : 'none';
+
+        const darkModeToggle = document.getElementById('darkMode');
+        
+        document.body.classList.toggle('dark-mode', darkModeToggle.checked);
+        
+        darkModeToggle.addEventListener('change', () => {
+            document.body.classList.toggle('dark-mode', darkModeToggle.checked);
+            localStorage.setItem('darkMode', darkModeToggle.checked);
+            
+            const logMsgs = document.querySelectorAll('.timeline-item.log-message');
+            logMsgs.forEach(logMessage => {
+                const originalText = logMessage.getAttribute('data-original-text');
+                if (originalText) {
+                    logMessage.innerHTML = convertAnsiToHtml(originalText);
+                }
+            });
+        });
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            const savedDarkMode = localStorage.getItem('darkMode');
+            if (savedDarkMode !== null) {
+                const isDarkMode = savedDarkMode === 'true';
+                darkModeToggle.checked = isDarkMode;
+                document.body.classList.toggle('dark-mode', isDarkMode);
+            }
+        });
+    </script>
+</body>
+</html>
