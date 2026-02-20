@@ -1,10 +1,11 @@
 from common.agent_functions import FUNCTION_DEFINITIONS
 from common.prompt_templates import DEEPGRAM_PROMPT_TEMPLATE
+from common.config import DEFAULT_VOICE_MODEL
 from datetime import datetime
 import os
 
 
-VOICE = "aura-2-thalia-en"
+VOICE = DEFAULT_VOICE_MODEL
 
 # Audio settings
 USER_AUDIO_SAMPLE_RATE = 16000
@@ -95,7 +96,7 @@ class AgentTemplates:
         self.agent_audio_sample_rate = AGENT_AUDIO_SAMPLE_RATE
         self.agent_audio_bytes_per_sec = AGENT_AUDIO_BYTES_PER_SEC
 
-        self.personality = f"You are {self.voiceName}, a friendly and professional customer service representative for Deepgram, a Voice API company who provides STT and TTS capabilities via API. Your role is to assist potential customers with general inquiries about Deepgram."
+        self.personality = f"You are {self.voiceName} from Deepgram. When a user asks about Deepgram, you MUST call kapa_query as your FIRST action. Never generate text before a function call."
         self.capabilities = "I can help you answer questions about Deepgram."
         self.prompt = DEEPGRAM_PROMPT_TEMPLATE.format(documentation="")
 

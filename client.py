@@ -11,26 +11,36 @@ import queue
 import sys
 import time
 import audioop
+import random
 import requests
 from datetime import datetime
 from common.agent_functions import FUNCTION_MAP
 from common.agent_templates import AgentTemplates, AGENT_AUDIO_SAMPLE_RATE
+from common.config import FILLER_MESSAGES, CORS_ALLOWED_ORIGINS, WEB_PORT
 import logging
 from common.log_formatter import CustomFormatter
 
 
 # Configure Flask and SocketIO
 app = Flask(__name__, static_folder="./static", static_url_path="/")
-socketio = SocketIO(app, cors_allowed_origins=["https://voice.deepgram.com", "http://localhost:8000", "http://127.0.0.1:8000"])
+socketio = SocketIO(app, cors_allowed_origins=CORS_ALLOWED_ORIGINS)
 
 # Configure logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Create console handler with the custom formatter
+# Console handler with colored output
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(CustomFormatter(socketio=socketio))
 logger.addHandler(console_handler)
+
+# File handler for persistent logs
+os.makedirs("logs", exist_ok=True)
+file_handler = logging.FileHandler("logs/voice_agent.log")
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s.%(msecs)03d %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+))
+logger.addHandler(file_handler)
 
 # Remove any existing handlers from the root logger to avoid duplicate messages
 logging.getLogger().handlers = []
@@ -185,7 +195,7 @@ class VoiceAgent:
                     # Send the audio data to Deepgram
                     await self.ws.send(data)
 
-        except websockets.exceptions.ConnectionClosedError:
+        except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
             # Connection closed gracefully (e.g., end_call), not an error
             logger.info("Sender stopped: connection closed")
         except Exception as e:
@@ -200,6 +210,62 @@ class VoiceAgent:
             last_function_response_time = None
             in_function_chain = False
 
+            # Latency tracking
+            turn_timestamps = {
+                "user_started_speaking": None,
+                "user_text_time": None,
+                "function_call_time": None,
+                "function_name": None,
+                "function_response_time": None,
+                "function_api_latency": None,
+                "assistant_first_text_time": None,
+                "first_audio_byte_time": None,
+            }
+
+            def reset_turn():
+                turn_timestamps["function_call_time"] = None
+                turn_timestamps["function_name"] = None
+                turn_timestamps["function_response_time"] = None
+                turn_timestamps["function_api_latency"] = None
+                turn_timestamps["assistant_first_text_time"] = None
+                turn_timestamps["first_audio_byte_time"] = None
+
+            def emit_latency():
+                ts = turn_timestamps
+                latency = {}
+
+                if ts["user_started_speaking"] and ts["user_text_time"]:
+                    latency["stt"] = round((ts["user_text_time"] - ts["user_started_speaking"]) * 1000)
+
+                if ts["user_text_time"] and ts["function_call_time"]:
+                    latency["llm_think"] = round((ts["function_call_time"] - ts["user_text_time"]) * 1000)
+                elif ts["user_text_time"] and ts["assistant_first_text_time"] and not ts["function_call_time"]:
+                    latency["llm_think"] = round((ts["assistant_first_text_time"] - ts["user_text_time"]) * 1000)
+
+                if ts["function_call_time"] and ts["function_response_time"]:
+                    latency["function"] = round((ts["function_response_time"] - ts["function_call_time"]) * 1000)
+                    latency["function_name"] = ts["function_name"]
+                    if ts["function_api_latency"]:
+                        latency["function_api"] = round(ts["function_api_latency"] * 1000)
+
+                if ts["function_response_time"] and ts["assistant_first_text_time"]:
+                    latency["llm_after_func"] = round((ts["assistant_first_text_time"] - ts["function_response_time"]) * 1000)
+
+                if ts["assistant_first_text_time"] and ts["first_audio_byte_time"]:
+                    latency["tts"] = round((ts["first_audio_byte_time"] - ts["assistant_first_text_time"]) * 1000)
+
+                if ts["user_text_time"] and ts["first_audio_byte_time"]:
+                    latency["total"] = round((ts["first_audio_byte_time"] - ts["user_text_time"]) * 1000)
+
+                if latency:
+                    socketio.emit("latency_update", latency)
+                    logger.info(f"Latency: {json.dumps(latency)}")
+
+            # Filler message tracking: signals when injected filler has finished playing
+            filler_complete = asyncio.Event()
+            filler_complete.set()
+            pending_filler_task = None
+
             with self.speaker:
                 async for message in self.ws:
                     if isinstance(message, str):
@@ -210,15 +276,32 @@ class VoiceAgent:
 
                         if message_type == "UserStartedSpeaking":
                             self.speaker.stop()
+                            turn_timestamps["user_started_speaking"] = current_time
+                            # If filler is playing and user interrupts, unblock immediately
+                            if not filler_complete.is_set():
+                                filler_complete.set()
+                                logger.info("Filler interrupted by user")
+
                         elif message_type == "ConversationText":
-                            # Emit the conversation text to the client
                             socketio.emit("conversation_update", message_json)
 
                             if message_json.get("role") == "user":
                                 last_user_message = current_time
                                 in_function_chain = False
+                                turn_timestamps["user_text_time"] = current_time
+                                reset_turn()
                             elif message_json.get("role") == "assistant":
                                 in_function_chain = False
+                                if not turn_timestamps["assistant_first_text_time"]:
+                                    turn_timestamps["assistant_first_text_time"] = current_time
+
+                        elif message_type == "AgentAudioDone":
+                            # If we're waiting for a filler to finish, signal completion
+                            if not filler_complete.is_set():
+                                filler_complete.set()
+                                logger.info("Filler message finished playing")
+                            elif turn_timestamps["user_text_time"]:
+                                emit_latency()
 
                         elif message_type == "FunctionCalling":
                             if in_function_chain and last_function_response_time:
@@ -234,6 +317,7 @@ class VoiceAgent:
                                 in_function_chain = True
 
                         elif message_type == "FunctionCallRequest":
+                            turn_timestamps["function_call_time"] = current_time
                             functions = message_json.get("functions", [])
                             if len(functions) > 1:
                                 raise NotImplementedError(
@@ -245,6 +329,7 @@ class VoiceAgent:
 
                             logger.info(f"Function call received: {function_name}")
                             logger.info(f"Parameters: {parameters}")
+                            turn_timestamps["function_name"] = function_name
 
                             start_time = time.time()
                             try:
@@ -254,15 +339,12 @@ class VoiceAgent:
                                         f"Function {function_name} not found"
                                     )
 
-                                # Special handling for end_call (needs websocket + closes connection)
+                                # end_call: special flow (farewell + close)
                                 if function_name == "end_call":
                                     result = await func(self.ws, parameters)
-                                    
-                                    # Extract messages
                                     function_response = result["function_response"]
                                     inject_message = result["inject_message"]
 
-                                    # First send the function response
                                     response = {
                                         "type": "FunctionCallResponse",
                                         "id": function_call_id,
@@ -273,48 +355,87 @@ class VoiceAgent:
                                     logger.info(
                                         f"Function response sent: {json.dumps(function_response)}"
                                     )
-
-                                    # Update the last function response time
                                     last_function_response_time = time.time()
 
-                                    # Then wait for farewell sequence to complete
                                     await wait_for_farewell_completion(
                                         self.ws, self.speaker, inject_message
                                     )
-
-                                    # Finally send the close message and exit
                                     logger.info(f"Sending ws close message")
                                     await close_websocket_with_timeout(self.ws)
                                     self.is_running = False
-                                    # Notify frontend that call ended
                                     socketio.emit("voice_agent_ended")
                                     break
-                                # switch_voice needs websocket
+
+                                # switch_voice: no filler needed
                                 elif function_name == "switch_voice":
                                     result = await func(self.ws, parameters)
                                     logger.info(f"Voice switched to: {result.get('new_voice_name')}")
+
+                                    execution_time = time.time() - start_time
+                                    logger.info(f"Function Execution Latency: {execution_time:.3f}s")
+                                    turn_timestamps["function_response_time"] = time.time()
+
+                                    response = {
+                                        "type": "FunctionCallResponse",
+                                        "id": function_call_id,
+                                        "name": function_name,
+                                        "content": json.dumps(result),
+                                    }
+                                    await self.ws.send(json.dumps(response))
+                                    logger.info(f"Function response sent: {json.dumps(result)}")
+                                    last_function_response_time = time.time()
+
+                                # All other functions (kapa_query, etc): inject filler, execute concurrently
                                 else:
-                                    result = await func(parameters)
+                                    filler = random.choice(FILLER_MESSAGES)
+                                    filler_complete.clear()
+                                    await self.ws.send(json.dumps({
+                                        "type": "InjectAgentMessage",
+                                        "message": filler,
+                                    }))
+                                    logger.info(f"Filler injected: {filler}")
 
-                                execution_time = time.time() - start_time
-                                logger.info(
-                                    f"Function Execution Latency: {execution_time:.3f}s"
-                                )
+                                    # Capture variables for background task
+                                    _func = func
+                                    _params = parameters
+                                    _call_id = function_call_id
+                                    _call_name = function_name
+                                    _start = start_time
 
-                                # Send the response back
-                                response = {
-                                    "type": "FunctionCallResponse",
-                                    "id": function_call_id,
-                                    "name": function_name,
-                                    "content": json.dumps(result),
-                                }
-                                await self.ws.send(json.dumps(response))
-                                logger.info(
-                                    f"Function response sent: {json.dumps(result)}"
-                                )
+                                    async def execute_after_filler():
+                                        nonlocal last_function_response_time
+                                        try:
+                                            result = await _func(_params)
 
-                                # Update the last function response time
-                                last_function_response_time = time.time()
+                                            execution_time = time.time() - _start
+                                            logger.info(f"Function Execution Latency: {execution_time:.3f}s")
+                                            turn_timestamps["function_response_time"] = time.time()
+                                            if isinstance(result, dict) and "latency_seconds" in result:
+                                                turn_timestamps["function_api_latency"] = result["latency_seconds"]
+
+                                            # Wait for filler to finish before sending response
+                                            await filler_complete.wait()
+
+                                            response = {
+                                                "type": "FunctionCallResponse",
+                                                "id": _call_id,
+                                                "name": _call_name,
+                                                "content": json.dumps(result),
+                                            }
+                                            await self.ws.send(json.dumps(response))
+                                            logger.info(f"Function response sent: {json.dumps(result)}")
+                                            last_function_response_time = time.time()
+                                        except Exception as e:
+                                            logger.error(f"Error in background function: {e}")
+                                            error_response = {
+                                                "type": "FunctionCallResponse",
+                                                "id": _call_id,
+                                                "name": _call_name,
+                                                "content": json.dumps({"error": str(e)}),
+                                            }
+                                            await self.ws.send(json.dumps(error_response))
+
+                                    pending_filler_task = asyncio.create_task(execute_after_filler())
 
                             except Exception as e:
                                 logger.error(f"Error executing function: {str(e)}")
@@ -337,6 +458,8 @@ class VoiceAgent:
                             break
 
                     elif isinstance(message, bytes):
+                        if not turn_timestamps["first_audio_byte_time"]:
+                            turn_timestamps["first_audio_byte_time"] = time.time()
                         await self.speaker.play(message)
 
         except Exception as e:
@@ -797,7 +920,7 @@ def handle_audio_data(data):
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("🚀 Voice Agent Demo Starting!")
+    print("Voice Agent Demo Starting!")
     print("=" * 60)
     print("\n1. Open this link in your browser to start the demo:")
     print("   http://localhost:8000")
@@ -806,4 +929,4 @@ if __name__ == "__main__":
     print("\nPress Ctrl+C to stop the server\n")
     print("=" * 60 + "\n")
 
-    socketio.run(app, host="0.0.0.0", port=8000, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="0.0.0.0", port=WEB_PORT, debug=True, allow_unsafe_werkzeug=True)

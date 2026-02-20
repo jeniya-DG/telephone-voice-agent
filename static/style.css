@@ -626,3 +626,73 @@ body:not(.dark-mode) .industry-item {
 .popup-button:active {
     transform: scale(0.95);
 }
+
+/* Latency card */
+.latency-card {
+    padding: 0 !important;
+    background: transparent !important;
+}
+
+.latency-breakdown {
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+    font-size: 12px;
+    background: rgba(0, 0, 0, 0.2);
+}
+
+.latency-title {
+    font-weight: bold;
+    margin-bottom: 6px;
+    font-size: 13px;
+    color: #87d7d7;
+}
+
+.latency-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 0;
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.latency-row.latency-sub {
+    padding-left: 8px;
+    opacity: 0.7;
+}
+
+.latency-row.latency-total {
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    margin-top: 4px;
+    padding-top: 4px;
+    font-weight: bold;
+    color: #fff;
+}
+
+.latency-value {
+    font-weight: bold;
+    color: #ff9800;
+}
+
+.latency-total .latency-value {
+    font-size: 13px;
+}
+
+/* Light mode latency */
+body.light-mode .latency-breakdown {
+    border-color: rgba(0, 0, 0, 0.1);
+    background: rgba(0, 0, 0, 0.04);
+}
+
+body.light-mode .latency-title {
+    color: #0086b3;
+}
+
+body.light-mode .latency-row {
+    color: rgba(0, 0, 0, 0.6);
+}
+
+body.light-mode .latency-row.latency-total {
+    border-top-color: rgba(0, 0, 0, 0.1);
+    color: #000;
+}

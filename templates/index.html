@@ -400,6 +400,60 @@
             });
         });
 
+        socket.on('latency_update', (data) => {
+            const timestamp = new Date().toISOString();
+            const currentCounter = messageCounter++;
+            messageOrder.push({ id: currentCounter, timestamp: timestamp, type: 'log' });
+
+            const logDiv = document.createElement('div');
+            logDiv.className = 'timeline-item log-message latency-card';
+            logDiv.dataset.messageId = currentCounter;
+
+            let html = '<div class="latency-breakdown">';
+            html += '<div class="latency-title">Latency Breakdown</div>';
+
+            if (data.stt !== undefined) {
+                html += `<div class="latency-row"><span>STT</span><span class="latency-value">${data.stt}ms</span></div>`;
+            }
+            if (data.llm_think !== undefined) {
+                html += `<div class="latency-row"><span>LLM Think</span><span class="latency-value">${data.llm_think}ms</span></div>`;
+            }
+            if (data.function !== undefined) {
+                const fname = data.function_name || 'function';
+                html += `<div class="latency-row"><span>${fname}</span><span class="latency-value">${data.function}ms</span></div>`;
+                if (data.function_api !== undefined) {
+                    html += `<div class="latency-row latency-sub"><span>└ API call</span><span class="latency-value">${data.function_api}ms</span></div>`;
+                }
+            }
+            if (data.llm_after_func !== undefined) {
+                html += `<div class="latency-row"><span>LLM (post-func)</span><span class="latency-value">${data.llm_after_func}ms</span></div>`;
+            }
+            if (data.tts !== undefined) {
+                html += `<div class="latency-row"><span>TTS</span><span class="latency-value">${data.tts}ms</span></div>`;
+            }
+            if (data.total !== undefined) {
+                const color = data.total < 2000 ? '#4caf50' : data.total < 4000 ? '#ff9800' : '#f44336';
+                html += `<div class="latency-row latency-total"><span>Total</span><span class="latency-value" style="color:${color}">${data.total}ms</span></div>`;
+            }
+            html += '</div>';
+            logDiv.innerHTML = html;
+
+            insertTimelineItem(logDiv, timestamp, logMessages);
+
+            requestAnimationFrame(() => {
+                const actualHeight = logDiv.offsetHeight;
+                messageHeights.set(currentCounter, actualHeight);
+                const conversationSpacer = createSpacer(actualHeight);
+                conversationSpacer.dataset.messageId = currentCounter;
+                insertTimelineItem(conversationSpacer, timestamp, conversationMessages);
+                if (!showLogsToggle.checked) {
+                    conversationSpacer.style.display = 'none';
+                    conversationSpacer.style.height = '0';
+                }
+                scrollToBottom();
+            });
+        });
+
         function insertTimelineItem(element, timestamp, container) {
             element.dataset.timestamp = timestamp;
             container.appendChild(element);

@@ -26,7 +26,7 @@ async def kapa_query(params):
     question = params.get("question", "")
     if not question:
         return {"error": "question is required"}
-    
+
     project_id = os.environ.get("KAPA_PROJECT_ID")
     api_key = os.environ.get("KAPA_API_KEY", "").strip()
     
@@ -165,6 +165,19 @@ VOICE_NAME_MAP = {
     "fujin": "aura-2-fujin-ja",
 }
 
+# Map accent/language to Deepgram language codes for STT
+ACCENT_TO_LANGUAGE_CODE = {
+    "american": "en",
+    "british": "en",
+    "australian": "en",
+    "spanish": "es",
+    "french": "fr",
+    "german": "de",
+    "italian": "it",
+    "dutch": "nl",
+    "japanese": "ja",
+}
+
 def get_voice_name(model):
     """Extract friendly name from model string."""
     # Remove prefix and language suffix
@@ -173,7 +186,7 @@ def get_voice_name(model):
     return name.capitalize()
 
 
-async def switch_voice(websocket, params):
+async def switch_voice(websocket, params, update_listen=True):
     """Switch the TTS voice based on user request, remembering previous gender/accent."""
     global _current_voice_state
     
@@ -235,8 +248,8 @@ async def switch_voice(websocket, params):
     _current_voice_state["model"] = selected_voice
     new_voice_name = get_voice_name(selected_voice)
     
-    # Switch the voice immediately
-    update_message = {
+    # Switch the TTS voice
+    update_speak = {
         "type": "UpdateSpeak",
         "speak": {
             "provider": {
@@ -245,13 +258,37 @@ async def switch_voice(websocket, params):
             }
         }
     }
-    await websocket.send(json.dumps(update_message))
-    logger.info(f"Voice switched to: {selected_voice}")
+    await websocket.send(json.dumps(update_speak))
+    logger.info(f"TTS voice switched to: {selected_voice}")
+    
+    accent = _current_voice_state["accent"]
+    lang_code = ACCENT_TO_LANGUAGE_CODE.get(accent, "en")
+    
+    # Also update the STT language to match (skip for Twilio/mulaw sessions)
+    if update_listen:
+        if lang_code == "en":
+            stt_language = "multi"
+        else:
+            stt_language = lang_code
+        
+        update_listen_msg = {
+            "type": "UpdateListen",
+            "listen": {
+                "provider": {
+                    "type": "deepgram",
+                    "model": "nova-3",
+                    "language": stt_language,
+                }
+            }
+        }
+        await websocket.send(json.dumps(update_listen_msg))
+        logger.info(f"STT language switched to: {stt_language}")
     
     # Return info for LLM to respond naturally
     return {
         "success": True,
         "new_voice_name": new_voice_name,
+        "language": lang_code,
         "message": f"Voice switched. You are now {new_voice_name}. Introduce yourself briefly.",
     }
 
@@ -278,18 +315,7 @@ async def end_call(websocket, params):
 FUNCTION_DEFINITIONS = [
     {
         "name": "kapa_query",
-        "description": """REQUIRED: Retrieve relevant documentation from the Deepgram knowledge base.
-        
-        You MUST call this function whenever the user asks about:
-        - Deepgram features (STT, TTS, Voice Agent, etc.)
-        - API usage or implementation
-        - Pricing or plans
-        - Supported languages or models
-        - Technical questions
-        - How something works
-        
-        This function returns context from documentation. Use the returned context to formulate your answer.
-        DO NOT answer from memory. ALWAYS call this function first to get accurate documentation context.""",
+        "description": """Call this function IMMEDIATELY for ANY question about Deepgram. Do NOT generate text before calling this function. No filler, no preamble - just call it. The system handles transition messages automatically.""",
         "parameters": {
             "type": "object",
             "properties": {
@@ -303,9 +329,12 @@ FUNCTION_DEFINITIONS = [
     },
     {
         "name": "switch_voice",
-        "description": """Call this when user asks to change voice/accent/language, OR when user speaks in a different language.
+        "description": """Call this when user asks to change voice/accent/language/gender, OR when user speaks in a different language.
         
-        Supported languages: american, british, australian, spanish, french, german, italian, dutch, japanese
+        Both male AND female voices are available for all accents/languages.
+        Supported accents/languages: american, british, australian, spanish, french, german, italian, dutch, japanese
+        
+        IMPORTANT: Always include the requested gender (male/female) in voice_type. If the user says "female voice", "woman", or a specific female name, include "female". If they say "male voice", "man", include "male".
         
         IMPORTANT: If user speaks Spanish, French, German, etc., call this function FIRST, then respond in their language.
         
@@ -316,7 +345,7 @@ FUNCTION_DEFINITIONS = [
             "properties": {
                 "voice_type": {
                     "type": "string",
-                    "description": "Voice/language request (e.g., 'spanish', 'french', 'british male')",
+                    "description": "MUST include gender AND accent/language. Examples: 'female american', 'male british', 'female australian', 'male spanish', 'female french'. Always specify both gender and accent.",
                 }
             },
             "required": ["voice_type"],
